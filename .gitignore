@@ -5,3 +5,4 @@ __pycache__/
 *.pt
 *.pth
 sam3.pt
+run_log.md

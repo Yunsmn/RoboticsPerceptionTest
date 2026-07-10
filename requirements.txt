@@ -1,0 +1,14 @@
+# Install ONE backend per Colab session — their deps conflict. Torch is preinstalled on Colab.
+#
+# Detection:
+#   ultralytics            # SAM 3 (auto-downloads sam3.pt on first use)
+#
+# Metric depth (pick one at a time):
+#   git+https://github.com/apple/ml-depth-pro.git   # Depth Pro
+#   unidepth                                          # UniDepthV2  (lpiccinelli-eth/UniDepth)
+#   mmcv mmengine timm                                # Metric3D-v2 (via torch.hub yvanyin/metric3d)
+#
+# Always available:
+numpy
+pillow
+matplotlib

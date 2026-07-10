@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+# model weights are downloaded at run time on Colab, never committed
+*.pt
+*.pth
+sam3.pt

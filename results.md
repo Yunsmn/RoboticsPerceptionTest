@@ -74,3 +74,12 @@ so only marks the best achievable; the anchored rows are what an honest pipeline
 
 For reference, pipelines measured earlier on the same simulation: three-camera triangulation ~1.1 mm,
 SAM plus known floor plane ~1.7 mm, monocular SAM + Depth-Anything ~12 mm. The grasp bar is ~2 mm.
+
+A note on comparing these fairly. Every one of these reference numbers is already *corrected* — none
+is a raw metric reading, so they line up with the anchored columns above, not the raw one. Depth-Anything
+in particular is a relative model with no native scale at all: its ~12 mm comes from fitting a full
+two-parameter affine (scale *and* offset) to known anchors, whereas Depth Pro reaches ~11.2 mm from just
+a one-parameter scale, because it is already metric up to a constant. So Depth Pro matches or beats it
+with a weaker correction. And because the reference figures come from an earlier, different harness, a
+few millimetres between any of them should not be read as a real difference; the only controlled
+comparison here is Depth Pro against UniDepthV2 on the same 48 frames.

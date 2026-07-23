@@ -254,7 +254,17 @@ class DepthAdapter:
         # argument, never trusted from the model).
         pred = self._model.inference([rgb])
         raw = np.asarray(pred.depth[0], dtype=np.float32)
-        return (float(focal_px) * raw / 300.0).astype(np.float32)
+        metric = (float(focal_px) * raw / 300.0).astype(np.float32)
+        # DA3 returns depth at the model's OWN internal (patch-aligned) resolution, not the
+        # input's -- e.g. 378x504 for a 480x640 frame. The intrinsics (focal_px, cx, cy) and every
+        # downstream deprojection assume the INPUT resolution, so resize back to it here. Keeping
+        # this in the adapter means any swapped-in depth model also honours the "(H,W) of the
+        # input" contract, instead of the point-cloud cell silently broadcasting a mismatched grid.
+        Hh, Ww = rgb.shape[:2]
+        if metric.shape[:2] != (Hh, Ww):
+            import cv2
+            metric = cv2.resize(metric, (Ww, Hh), interpolation=cv2.INTER_LINEAR)
+        return metric
 
     def free(self):
         del self._model; self._model = None
@@ -764,7 +774,7 @@ else:
     _stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S'); _dest = 'logs/run4_%s.md' % _stamp
     shutil.copy('run_log.md', _dest)
     _url = 'https://%s@github.com/%s.git' % (_TOKEN, _REPO)
-    _sh(['git','config','user.email','younesosf@gmail.com']); _sh(['git','config','user.name','Yunsmn'])
+    _sh(['git','config','user.email','younes.menfalouti@um6p.ma']); _sh(['git','config','user.name','Yunsmn'])
     _sh(['git','pull','--rebase','--autostash', _url, 'main'], secret=_TOKEN)
     _sh(['git','add', _dest]); _sh(['git','add', 'viz'])
     _sh(['git','add', 'metrics.json']); _sh(['git','add', 'trajectory.json'])

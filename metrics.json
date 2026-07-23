@@ -1,0 +1,19 @@
+{
+  "frame": "data/frames/pose_000.png",
+  "endpoint_err_2d_px_initial": 20.8,
+  "endpoint_err_2d_px_final": 26.1,
+  "improvement_2d_px": -5.3,
+  "endpoint_err_3d_mm_final": 1639.3,
+  "pred_depth_m_at_endpoint": 2.5859,
+  "gt_depth_m_at_endpoint": 0.9558,
+  "path_length_px_per_stage": [
+    134.8,
+    129.4,
+    129.4,
+    129.4
+  ],
+  "endpoint_consistency_px_mean_step": 1.8,
+  "n_refinement_stages": 3,
+  "rynnbrain_model": "Alibaba-DAMO-Academy/RynnBrain1.1-2B",
+  "depth_model": "depth-anything/DA3METRIC-LARGE"
+}

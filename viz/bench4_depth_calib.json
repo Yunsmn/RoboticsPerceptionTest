@@ -1,0 +1,9 @@
+{
+  "a": 2.0009944526977472,
+  "b": 0.19848253616947234,
+  "n_anchors_used": 193,
+  "n_anchors_total": 376,
+  "gripper_check_raw_m": 2.4805712699890137,
+  "gripper_check_calibrated_m": 0.9948770403862,
+  "gripper_check_true_m": 0.995
+}

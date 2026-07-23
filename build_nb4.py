@@ -34,25 +34,57 @@ def code(text):
 # ─────────────────────────────────────────────────────────────────────────────
 # Title
 # ─────────────────────────────────────────────────────────────────────────────
-md(r"""# SO-101 Perception Benchmark 4 — DA3 point-cloud + RynnBrain iterative trajectory (proof-of-concept)
+md(r"""# SO-101 Perception Benchmark 4 — calibrated DA3 point-cloud + RynnBrain multi-view triangulation
+
+**v2 — rewritten after a real Colab run exposed 3 concrete failures. See "What changed" below.**
 
 Single frame, two heavy models that cannot share a Python process (conflicting pip pins), so this
 notebook runs in **two stages, each its own Colab kernel**:
 
 - **Stage A** (§1A install → Restart → §0,§2,§3A,§4A): **Depth Anything 3** (`DA3METRIC-LARGE`)
-  predicts metric depth on the ORIGINAL RGB only → builds a point cloud (`camera_math` calibration,
-  no ground truth) → renders 3 re-projected viewpoints with **Open3D** → saves RGB + depth viz +
-  cloud (`.ply`) + 3 renders to `viz/`, then frees DA3 from memory.
-- **Stage B** (§1B install → Restart → §0,§2,§3B,§4B): **RynnBrain** (VLM) predicts a manipulation
-  trajectory from the gripper's known start to a grasp on the target, seeing ONLY the original RGB
-  first, then refining that SAME trajectory once per rendered view (never generating a fresh one).
-  DA3 is never imported in this kernel; it only reads the artifacts Stage A left on disk.
+  predicts depth on the ORIGINAL RGB → **calibrated against robot self-knowledge** (floor grid +
+  base origin + the known gripper pixel, robust inverse-depth affine fit — DA3's raw output on
+  these clean renders is ~2.7x too far, the same "reads the scene as smooth floor" failure mode
+  bench1 already measured) → builds a point cloud from the CALIBRATED depth → renders 3
+  purpose-framed viewpoints with **Open3D** (workspace-centred + elevation-lifted, not a blind
+  azimuth spin) → saves RGB + depth viz + cloud (`.ply`) + 3 renders + each view's exact camera
+  pose to `viz/`, then frees DA3 from memory.
+- **Stage B** (§1B install → Restart → §0,§2,§3B,§4B): **RynnBrain** (VLM) predicts a
+  gripper→target trajectory **independently on each of the 4 views** (original + 3 renders,
+  told that view's own projected gripper pixel as the start — never a "refine the previous
+  answer" turn). The 4 views' 2D endpoints are **triangulated** into one 3D grasp point
+  (`camera_math.triangulate_nrays`) — this is what makes 2D pixel picks into a metric 3D
+  estimate, since a single view is fundamentally one ray, not a point. DA3 is never imported in
+  this kernel; it only reads the artifacts Stage A left on disk.
 - **§5/§6/§7** run in the same kernel as Stage B (no third restart): evaluate against held-out
   ground truth, write a Markdown report, push.
 
-**Read `docs/archive` conventions aside — this is new territory for the repo (two restarts, not
-one), so the run order is spelled out explicitly at every step below. Follow it literally; do not
-just click "Run all" — see the warning in §1A.**
+## What changed from v1 (the first real run, logs/run4_20260723_132657.md, was a clear negative)
+1. **Depth calibration added (§4A).** v1 fed DA3's raw `focal*net/300` straight into the cloud;
+   it read the cube at 2.59m vs a true 0.96m (1639mm 3D error). Now calibrated with a robust
+   inverse-depth affine fit against 3 honest anchor families: a floor grid, the robot base
+   origin, and the known gripper pixel — no ground truth, same "up-to-affine monocular depth"
+   fact bench1-3 already exploit, just done properly this time.
+2. **Render framing fixed (§4A).** v1 spun ±90°/±45° azimuth around the scene origin; two of
+   three renders came back near-empty (arm+cube swung to the frame edge — confirmed by eye on
+   the pushed PNGs). Now uses workspace-centred lookat + elevation lift (empirically tuned to
+   keep gripper/cube/base in frame), which also gives real vertical baseline for triangulation
+   (a pure azimuth spin barely moves the camera in z).
+3. **Triangulate instead of "refine" (§4B) — the core redesign.** v1 asked RynnBrain to *edit*
+   its own previous 2D answer while looking at a second image; the model just echoed the same
+   points back (see v1's raw outputs — refine 1/2/3 are near-identical), making the endpoint
+   *worse* (20.8→26.1px). A 2D trajectory is a ray, not a 3D point, and no amount of "please
+   reconsider" turns one ray into geometry. Now each view gets an **independent** fresh
+   prediction (never shown a previous answer), and the 4 endpoints are triangulated. The known
+   gripper pixel, projected into each view, both anchors that view's start point AND gives a
+   free self-consistency check: triangulating what RynnBrain *actually drew* as each view's
+   start and comparing to the known `GRIPPER_TCP_XYZ` measures the whole pipeline's geometric
+   accuracy independent of the target itself.
+4. **3D eval now comes from triangulation, not a depth lookup (§5).** v1's only 3D number was
+   "look up DA3's raw depth at the predicted pixel" — a single, uncalibrated read. Now it's
+   `endpoint_err_3d_mm` from `triangulate_nrays` over 4 views; the depth model's job shrinks to
+   what it's actually good for (an honest point cloud for framing renders), not carrying the
+   whole 3D estimate alone.
 
 ## Models (pin exactly, see the assumptions boxes in §3A/§3B for how these were chosen)
 - Depth: `depth-anything/DA3METRIC-LARGE` (ByteDance-Seed, Apache-2.0, not gated).
@@ -66,6 +98,8 @@ just click "Run all" — see the warning in §1A.**
 `GT_UV` / `GT_XYZ` / `GT_DEPTH_M` are loaded in §2 for the assert self-check and are used **only**
 in §5 (Evaluate). They are never passed into a DA3 or RynnBrain call. The gripper start point is
 **measured FK of the parked home pose**, not cube ground truth — see the provenance comment in §2.
+Depth calibration anchors (floor grid, base origin, gripper pixel) are all robot/rig facts, never
+the target object's own ground truth.
 
 ## Run order (follow literally — do not "Run all" across a restart)
 1. Run §0 (2 cells), then §1A (1 cell). **Runtime → Restart runtime.**
@@ -278,24 +312,116 @@ print('DA3 ready.')
 # ─────────────────────────────────────────────────────────────────────────────
 # 4A. Stage A execution
 # ─────────────────────────────────────────────────────────────────────────────
-md(r"""## 4A. Stage A — depth, point cloud, 3 rendered viewpoints (writes `viz/`, then frees DA3)
+md(r"""## 4A. Stage A — calibrated depth, point cloud, 3 framed viewpoints (writes `viz/`, then frees DA3)
 
 Only `img0` (the original RGB) and this frame's own DA3 depth go into the cloud — no ground
-truth anywhere. The 3 renders are saved to disk so Stage B (a separate kernel, after §1B +
-restart) can read them without ever importing DA3 or torch/xformers built for it.""")
+truth anywhere. The 3 renders (+ their exact camera poses) are saved to disk so Stage B (a
+separate kernel, after §1B + restart) can read them without ever importing DA3 or torch/xformers
+built for it.
 
-code(r"""depth_m = DEPTH.infer_metric_depth(img0, f)
-np.save('viz/bench4_depth_m.npy', depth_m)
+**Depth calibration (new in v2):** DA3's raw `focal*net/300` output measured **2.59m at the cube
+vs a true 0.96m** on the first real run — the model reads this clean synthetic scene as a smooth
+floor (the same OOD failure bench1 already found for Depth Pro/UniDepth on this dataset). Rather
+than trust that number, we fit a robust affine in **inverse depth** (`1/d_true = a*(1/d_raw)+b` —
+monocular nets are affine in inverse depth, not depth itself) against three honest,
+object-independent anchor families: a **floor grid** (z=0, `project()` from §2 gives the exact
+forward depth analytically), the **robot base origin** (0,0,0), and the **known gripper pixel**
+(`GRIPPER_TCP_UV` / `GRIPPER_TCP_DEPTH_M` — the same FK constant used as the trajectory start).
+The fit is robust (drop the worst 20% residual, refit, 3 rounds) because some floor-grid pixels
+are occluded by the arm itself and would otherwise poison the fit.""")
+
+code(r"""def calibrate_depth_inverse_affine(depth_raw, anchors, robust_iters=3, drop_frac=0.2,
+                                    seed=0, max_pairs=20000):
+    '''Fit depth_true^-1 = a*depth_raw^-1 + b from (u,v,d_true) anchors sampled in depth_raw,
+    robust to occlusion outliers (e.g. floor pixels blocked by the arm). Monocular metric depth
+    nets are approximately affine in INVERSE depth -- the same "up-to-affine" fact bench1-3
+    already exploit with a single floor/base anchor, generalised here to a robust multi-anchor fit.
+
+    SEEDED WITH THEIL-SEN, not plain least squares: a local synthetic test (14pct contaminated
+    anchors, occlusion-sized errors) showed that seeding the very first round with ordinary
+    least squares on the FULL contaminated set can drag the fit so far off that "drop the worst
+    20pct residual" starts discarding GOOD points instead of bad ones -- OLS is not
+    breakdown-robust to a handful of high-leverage outliers. The median of ALL pairwise slopes
+    (Theil-Sen) has a ~29pct breakdown point and needs no threshold, so it seeds a trustworthy
+    starting line; the iterative trim-and-refit (3 rounds, worst 20pct dropped each round) then
+    polishes it. Verified locally to recover the injected (a,b) exactly at 14pct AND 25pct
+    contamination; plain-OLS seeding failed even at 14pct (recovered a=0.21 vs true a=0.42).
+    MODEL-AGNOSTIC: takes a plain depth array + anchor list, not the adapter -- swapping
+    DepthAdapter for another model still gets calibrated by this same function.
+    Returns (a, b, n_used, n_total).'''
+    uu = np.array([p[0] for p in anchors], float); vv = np.array([p[1] for p in anchors], float)
+    d_true = np.array([p[2] for p in anchors], float)
+    ui = np.clip(np.round(uu).astype(int), 0, depth_raw.shape[1] - 1)
+    vi = np.clip(np.round(vv).astype(int), 0, depth_raw.shape[0] - 1)
+    d_raw = depth_raw[vi, ui].astype(float)
+    keep = np.isfinite(d_raw) & (d_raw > 1e-6) & np.isfinite(d_true) & (d_true > 1e-6)
+    inv_raw = 1.0 / d_raw[keep]; inv_true = 1.0 / d_true[keep]
+    n_total = len(inv_raw)
+    idx = np.arange(n_total)
+    if n_total < 3:
+        return 1.0, 0.0, 0, n_total
+
+    rng = np.random.default_rng(seed)
+    ii, jj = np.triu_indices(n_total, k=1)
+    if len(ii) > max_pairs:
+        sel = rng.choice(len(ii), size=max_pairs, replace=False)
+        ii, jj = ii[sel], jj[sel]
+    dx = inv_raw[ii] - inv_raw[jj]
+    ok = np.abs(dx) > 1e-9
+    slopes = (inv_true[ii[ok]] - inv_true[jj[ok]]) / dx[ok]
+    a = float(np.median(slopes))
+    b = float(np.median(inv_true - a * inv_raw))
+
+    for _ in range(robust_iters):
+        resid = np.abs(a * inv_raw[idx] + b - inv_true[idx])
+        n_drop = int(round(len(idx) * drop_frac))
+        if n_drop == 0 or len(idx) - n_drop < 3:
+            break
+        order = np.argsort(resid)
+        idx = idx[order[:len(idx) - n_drop]]
+        A = np.vstack([inv_raw[idx], np.ones(len(idx))]).T      # OLS refit is fine once seeded
+        a, b = np.linalg.lstsq(A, inv_true[idx], rcond=None)[0]  # robustly and outliers are gone
+    return float(a), float(b), int(len(idx)), int(n_total)
+
+# --- anchors: all robot/rig facts, never the target object's own ground truth ---
+FLOOR_ANCHORS = []
+for xw in np.arange(-0.20, 0.55 + 1e-9, 0.04):
+    for yw in np.arange(-0.40, 0.42 + 1e-9, 0.04):
+        u_a, v_a, d_a = project([float(xw), float(yw), 0.0])
+        if d_a > 0.05 and 0 <= u_a < W and 0 <= v_a < H:
+            FLOOR_ANCHORS.append((u_a, v_a, d_a))
+u_base, v_base, d_base = project([0.0, 0.0, 0.0])
+BASE_ANCHOR = [(u_base, v_base, d_base)] if (d_base > 0.05 and 0 <= u_base < W and 0 <= v_base < H) else []
+GRIPPER_ANCHOR = [(GRIPPER_TCP_UV[0], GRIPPER_TCP_UV[1], GRIPPER_TCP_DEPTH_M)]
+DEPTH_CALIB_ANCHORS = FLOOR_ANCHORS + BASE_ANCHOR + GRIPPER_ANCHOR
+print('depth calibration anchors: %d floor + %d base + %d gripper = %d total'
+      % (len(FLOOR_ANCHORS), len(BASE_ANCHOR), len(GRIPPER_ANCHOR), len(DEPTH_CALIB_ANCHORS)))
+
+depth_raw = DEPTH.infer_metric_depth(img0, f)
+DEPTH_CALIB_A, DEPTH_CALIB_B, DEPTH_CALIB_N_USED, DEPTH_CALIB_N_TOTAL = calibrate_depth_inverse_affine(
+    depth_raw, DEPTH_CALIB_ANCHORS)
+print('calibration fit: a=%.6f b=%.6f (used %d/%d anchors after robust rejection)'
+      % (DEPTH_CALIB_A, DEPTH_CALIB_B, DEPTH_CALIB_N_USED, DEPTH_CALIB_N_TOTAL))
+depth_m = 1.0 / np.clip(DEPTH_CALIB_A / np.clip(depth_raw, 1e-6, None) + DEPTH_CALIB_B, 1e-6, None)
+
 _gu, _gv = int(round(GRIPPER_TCP_UV[0])), int(round(GRIPPER_TCP_UV[1]))
-print('depth range: %.3f - %.3f m | at gripper-start px: %.3f m (FK says %.3f m)'
-      % (float(depth_m.min()), float(depth_m.max()), float(depth_m[_gv, _gu]), GRIPPER_TCP_DEPTH_M))
+print('gripper-pixel check: raw=%.3fm -> calibrated=%.3fm  (true=%.3fm)'
+      % (float(depth_raw[_gv, _gu]), float(depth_m[_gv, _gu]), GRIPPER_TCP_DEPTH_M))
+print('depth range after calibration: %.3f - %.3f m' % (float(depth_m.min()), float(depth_m.max())))
+np.save('viz/bench4_depth_m.npy', depth_m)
+with open('viz/bench4_depth_calib.json', 'w') as _fjs:
+    json.dump({'a': DEPTH_CALIB_A, 'b': DEPTH_CALIB_B, 'n_anchors_used': DEPTH_CALIB_N_USED,
+               'n_anchors_total': DEPTH_CALIB_N_TOTAL,
+               'gripper_check_raw_m': float(depth_raw[_gv, _gu]),
+               'gripper_check_calibrated_m': float(depth_m[_gv, _gu]),
+               'gripper_check_true_m': GRIPPER_TCP_DEPTH_M}, _fjs, indent=2)
 
 import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
 fig, ax = plt.subplots(figsize=(6, 4.5))
-im = ax.imshow(depth_m, cmap='turbo'); ax.set_title('DA3 metric depth (m)'); ax.axis('off')
+im = ax.imshow(depth_m, cmap='turbo'); ax.set_title('DA3 depth, calibrated (m)'); ax.axis('off')
 plt.colorbar(im, ax=ax, fraction=0.046)
 plt.savefig('viz/bench4_01_depth_da3.png', dpi=110, bbox_inches='tight'); plt.close()
-print('saved viz/bench4_01_depth_da3.png')
+print('saved viz/bench4_01_depth_da3.png, viz/bench4_depth_m.npy, viz/bench4_depth_calib.json')
 """)
 
 code(r"""# Open3D CPU/software-rendering fallback flags -- MUST be set before the first `import open3d`
@@ -333,14 +459,22 @@ o3d.io.write_point_cloud('viz/bench4_cloud.ply', pcd)
 print('saved viz/bench4_cloud.ply')
 """)
 
-code(r"""# --- 3 complementary re-rendered viewpoints of the SAME monocular cloud (see the honest caveat
-# in §6). Views rotate the ORIGINAL side-camera azimuth by ~45deg increments around the scene's
-# own look-at point (CM.SIDE_LOOKAT -- a known SCENE/rig constant the side camera itself already
-# uses to render every data/ frame, not anything derived from an object's ground truth).
+code(r"""# --- 3 purpose-framed re-rendered viewpoints of the SAME monocular (now calibrated) cloud (see
+# the honest caveat in §6). v1 orbited the SCENE ORIGIN by +-45/90deg azimuth around the side
+# camera's own look-at point and threw 2 of 3 renders nearly empty (arm+cube swung to the frame
+# edge -- confirmed by eye on the pushed PNGs). The fix is a TRANSLATION, not just a rotation:
+# aim at the WORKSPACE centre (raised to arm height, not the floor-level scene origin) and lift
+# the elevation well below the side camera's own -35deg. The elevation lift matters as much as
+# the translation -- a pure azimuth spin barely moves the camera in z, which starves triangulation
+# of vertical baseline (ill-conditioned in z even with 4 views). These (az,el) pairs are centred
+# on the side camera's own az=135 +-25deg, at el -50/-55 (empirically tuned so gripper + cube +
+# base + container all stay in frame -- see §6 for the actual renders).
+WORK_LOOKAT = np.array([0.13, -0.07, 0.08])   # workspace centre, raised to include arm height
+VIEW_DIST = 0.70
 VIEWS = [
-    ('oblique45', CM.SIDE_AZ - 45.0, CM.SIDE_EL),
-    ('left', CM.SIDE_AZ - 90.0, CM.SIDE_EL),
-    ('right', CM.SIDE_AZ + 90.0, CM.SIDE_EL),
+    ('A_az110_el50', 110.0, -50.0),
+    ('B_az135_el55', 135.0, -55.0),
+    ('C_az160_el50', 160.0, -50.0),
 ]
 
 def _cv_extrinsic(cam_pos_v, R_cw_v):
@@ -369,9 +503,24 @@ def _fallback_render(view_cam_pos, view_R_cw, out_path, title):
     ax.set_xlim(0, W); ax.set_ylim(H, 0); ax.axis('off'); ax.set_title(title)
     plt.savefig(out_path, dpi=100, bbox_inches='tight'); plt.close()
 
+# Clean up any renders from a PREVIOUS notebook version/run before writing this run's set. v1
+# named these 'oblique45'/'left'/'right'; v2 uses 'A_az110_el50' etc -- different filenames, so
+# without this cleanup the old ones just sit in viz/ alongside the new ones (they were pushed to
+# the repo by the earlier run) and Stage B's glob('viz/bench4_02_render_*.png') would pick up
+# BOTH sets, including stale ones with no matching entry in this run's VIEW_POSES. Also drop v1's
+# dead trajectory filenames (bench4_03_traj_initial.png / bench4_04_traj_refine_*.png) for hygiene
+# -- v2 writes bench4_05_traj_<name>.png instead.
+for _stale in glob.glob('viz/bench4_02_render_*.png') + glob.glob('viz/bench4_03_traj_*.png') + \
+              glob.glob('viz/bench4_04_traj_*.png'):
+    os.remove(_stale)
+
 RENDER_PATHS = []
+VIEW_POSES = {}    # render_path -> {f,cx,cy,cam_pos,R_cw,az,el,dist,lookat} -- Stage B (a
+                    # SEPARATE kernel after restart) needs the exact pose each render was taken
+                    # from to project the gripper into it and to build triangulation rays; Python
+                    # variables don't survive the restart, so this is persisted to disk.
 for name, az, el in VIEWS:
-    vf, vcx, vcy, vcam_pos, vR_cw = CM.free_cam_params(az, el, CM.SIDE_DIST, CM.SIDE_LOOKAT, W=W, H=H)
+    vf, vcx, vcy, vcam_pos, vR_cw = CM.free_cam_params(az, el, VIEW_DIST, WORK_LOOKAT, W=W, H=H)
     out_path = 'viz/bench4_02_render_%s.png' % name
     ok = False
     try:
@@ -393,7 +542,14 @@ for name, az, el in VIEWS:
     if not ok:
         _fallback_render(vcam_pos, vR_cw, out_path, name)
     RENDER_PATHS.append(out_path)
+    VIEW_POSES[out_path] = {'f': float(vf), 'cx': float(vcx), 'cy': float(vcy),
+                             'cam_pos': vcam_pos.tolist(), 'R_cw': vR_cw.tolist(),
+                             'az': az, 'el': el, 'dist': VIEW_DIST, 'lookat': WORK_LOOKAT.tolist()}
     print('saved', out_path, '(open3d)' if ok else '(fallback splat)')
+
+with open('viz/bench4_view_poses.json', 'w') as _fjs:
+    json.dump(VIEW_POSES, _fjs, indent=2)
+print('saved viz/bench4_view_poses.json (%d view poses)' % len(VIEW_POSES))
 """)
 
 code(r"""DEPTH.free()
@@ -417,7 +573,7 @@ get_ipython().system('pip -q install -U "transformers==5.2.0" accelerate')
 # ─────────────────────────────────────────────────────────────────────────────
 # 3B. RynnBrain adapter
 # ─────────────────────────────────────────────────────────────────────────────
-md(r"""## 3B. RynnBrain adapter — trajectory prediction + refinement
+md(r"""## 3B. RynnBrain adapter — per-view trajectory prediction
 
 **Model choice (verified against the live HF listing, not guessed):** the task asked for the 2B
 *manipulation-planning* checkpoint ("RynnBrain-Plan"). **`RynnBrain-Plan-2B` does not exist** —
@@ -436,16 +592,31 @@ bigger GPU (A100/L4) — verify VRAM before doing so.
 </trajectory>`, coordinates normalised to **[0,1000]** over the image's own width/height. That
 cookbook example is free-form (the model decides its own start point, single image, no history).
 
+**v2 redesign (§4B): independent per-view prediction + triangulation, not "refine".** v1 fed the
+model its own previous `<trajectory>` answer plus a second image and asked it to "refine" — the
+real run showed it just echoing the same points back (see the v1 raw outputs preserved in
+`logs/run4_20260723_132657.md`), which made the endpoint worse. A 2D trajectory from one image is
+a ray, not a 3D point; asking a VLM to introspect and edit its own prior answer is not what turns
+one ray into geometry — triangulating **independent** predictions from views with known,
+different poses is. So §4B now calls `RYNN.predict()` **once per view, fresh, with no history**
+(the model never sees a previous trajectory), and 3D geometry is recovered afterward by
+`camera_math.triangulate_nrays` over the 4 views' endpoints.
+
 **Assumptions this adapter makes beyond what the cookbook demonstrates — verify on the first
 Colab run, not asserted as fact:**
-1. Telling the model the start point in the instruction text ("its current position is pixel
-   (x,y)... the FIRST point of your trajectory must be...") makes it anchor there. If it doesn't,
-   §4B numerically re-anchors the trajectory at the known `GRIPPER_TCP_UV` (logged, not silent).
-2. The "refine, don't regenerate" instruction (§4B, feeding the original + a rendered view + the
-   previous `<trajectory>` back in) is a construction for this experiment — the cookbook only
-   shows single-shot prediction over independent inputs, never an explicit refine-given-history
-   turn. If the model ignores history and free-generates instead, that will show up directly as
-   low trajectory consistency across iterations (§5 reports this) rather than failing silently.
+1. Telling the model the start point in the instruction text ("its current position in THIS
+   image is pixel (x,y)... the FIRST point of your trajectory must be...") makes it anchor there,
+   in EVERY view (not just the original). If it doesn't, §4B numerically re-anchors the drawn
+   trajectory at that view's own projected gripper pixel (logged, not silent) for the path/viz —
+   but keeps the model's own UNMODIFIED first point separately for the gripper-anchor
+   triangulation check (§4B/§5), since that check exists specifically to measure whether the
+   model actually complies, not to paper over it.
+2. Each per-view prediction is assumed independent enough that triangulating across them is
+   meaningful — i.e. RynnBrain is not so anchored to one canonical "reading" of the scene that
+   all 4 views collapse to the same pixel-ratio answer regardless of the actual rendered content.
+   The gripper-anchor residual (§5) is partly a check on this: if the 4 views' drawn start points
+   don't triangulate close to the known `GRIPPER_TCP_XYZ`, the per-view geometry (pose and/or
+   model behaviour) is suspect and the endpoint triangulation should be read with that in mind.
 3. Gating: the model card shows no gated-repo banner, so `load()` tries anonymously first and
    only asks for `HF_TOKEN` if the download actually 401s/403s (same UX as bench3's SAM 3 gate,
    but not a hard requirement up front since we could not confirm gating is actually needed).""")
@@ -527,48 +698,47 @@ print('RynnBrain ready:', RYNNBRAIN_MODEL_ID)
 # ─────────────────────────────────────────────────────────────────────────────
 # 4B. Stage B execution
 # ─────────────────────────────────────────────────────────────────────────────
-md(r"""## 4B. Stage B — initial trajectory, then iterative refinement over the 3 rendered views
+md(r"""## 4B. Stage B — independent per-view trajectories, then triangulate to 3D
 
-The FIRST image RynnBrain ever sees is the original RGB (never a render). Each refinement step
-adds exactly one rendered view on top of the original + the previous trajectory text, and is
-told to refine, not regenerate. `RENDER_PATHS` is rebuilt from disk (`glob`) because Stage A's
-Python variables did not survive the restart — only its files did.""")
+4 views total: the **original** RGB (the true side-cam pose from §2) plus the **3 rendered**
+views from §4A. Each gets its own **fresh, independent** `RYNN.predict()` call — no view is ever
+told a previous answer, so there is nothing to just echo back. `RENDER_PATHS` and
+`VIEW_POSES` are rebuilt/reloaded from disk because Stage A's Python variables did not survive
+the restart — only its files did.
+
+Per view: project the known `GRIPPER_TCP_XYZ` through THAT view's own camera pose to get the
+start pixel to tell RynnBrain (for the original view this is exactly `GRIPPER_TCP_UV`; for the
+renders it's wherever the gripper actually falls in that reprojection). After all 4 predictions:
+triangulate the 4 endpoints -> the 3D grasp point, and SEPARATELY triangulate the 4
+(unmodified) start points RynnBrain actually drew -> compare to the known gripper position as a
+self-consistency check on the whole pipeline's geometry.""")
 
 code(r"""RENDER_PATHS = sorted(glob.glob('viz/bench4_02_render_*.png'))
 assert RENDER_PATHS, 'No renders found in viz/ -- run Stage A (1A/2/3A/4A) first, in an earlier kernel.'
+with open('viz/bench4_view_poses.json') as _fjs:
+    VIEW_POSES = json.load(_fjs)
 print('found', len(RENDER_PATHS), 'rendered views:', RENDER_PATHS)
 
-START_U01000 = GRIPPER_TCP_UV[0] / W * 1000.0
-START_V01000 = GRIPPER_TCP_UV[1] / H * 1000.0
+def project_pt(P, f_, cx_, cy_, cam_pos_, R_cw_):
+    # same math as §2's project(), parametrised per-view instead of closed over the original
+    # side-cam pose -- used to find where the KNOWN gripper falls in each rendered view.
+    xc, yc, zc = np.asarray(R_cw_, float).T @ (np.asarray(P, float) - np.asarray(cam_pos_, float))
+    return cx_ + f_ * xc / -zc, cy_ - f_ * yc / -zc, -zc
 
 FORMAT_INSTR = ('Return up to 10 key trajectory points as a list of tuples in the format: '
                 '<trajectory> (x1, y1), (x2, y2), ... </trajectory>. All coordinates normalised '
                 'to the [0, 1000] range, matching this image\'s own width and height.')
 
-initial_prompt = (
-    'You are controlling a robot gripper. Its current position is the pixel (%.0f, %.0f) '
-    '(normalised 0-1000). Predict a collision-aware manipulation trajectory that moves the '
-    'gripper from its current position to a grasp pose on the %s. The FIRST point of your '
-    'trajectory must be the gripper\'s given start position. %s'
-    % (START_U01000, START_V01000, TARGET_LABEL, FORMAT_INSTR)
-)
-print(initial_prompt)
+def build_traj_prompt(start_u1000, start_v1000, target_label):
+    return (
+        'You are controlling a robot gripper. Its current position in THIS image is the pixel '
+        '(%.0f, %.0f) (normalised 0-1000). Predict a collision-aware manipulation trajectory '
+        'that moves the gripper from its current position to a grasp pose on the %s, as seen in '
+        'THIS image. The FIRST point of your trajectory must be the gripper\'s given start '
+        'position. %s' % (start_u1000, start_v1000, target_label, FORMAT_INSTR)
+    )
 
-raw0 = RYNN.predict([IMG_PATH], initial_prompt)
-print('--- raw RynnBrain output (initial) ---'); print(raw0)
-traj0 = parse_trajectory(raw0, W, H)
-if not traj0:
-    raise RuntimeError('Could not parse any (x,y) points from the initial RynnBrain response -- '
-                        'the prompt/format assumption in 3B may not hold for this checkpoint; '
-                        'inspect raw0 above and adjust FORMAT_INSTR / TRAJ_RE.')
-_start_err_px = float(np.hypot(traj0[0][0] - GRIPPER_TCP_UV[0], traj0[0][1] - GRIPPER_TCP_UV[1]))
-print('model start vs given gripper origin: %.1f px' % _start_err_px)
-# Numeric safety net (logged, never silent): the trajectory must NUMERICALLY start at the known
-# gripper origin regardless of what the model's own first token said.
-traj0 = [GRIPPER_TCP_UV] + traj0
-""")
-
-code(r"""def draw_traj(img_path, traj, out_path, title):
+def draw_traj(img_path, traj, out_path, title):
     im = Image.open(img_path).convert('RGB'); draw = ImageDraw.Draw(im)
     for i in range(len(traj) - 1):
         draw.line([traj[i], traj[i + 1]], fill=(255, 0, 0), width=3)
@@ -578,90 +748,200 @@ code(r"""def draw_traj(img_path, traj, out_path, title):
     im.save(out_path)
     return out_path
 
-TRAJ_HISTORY = [{'stage': 'initial', 'points_px': [list(p) for p in traj0], 'raw': raw0}]
-draw_traj(IMG_PATH, traj0, 'viz/bench4_03_traj_initial.png', 'initial trajectory')
-print('saved viz/bench4_03_traj_initial.png')
+# --- the 4 views: the TRUE original camera + the 3 rendered/re-projected ones, each with its own
+# exact pose. The original is included as a view like any other (not special-cased) so the
+# triangulation treats it uniformly with the renders.
+ALL_VIEWS = [{'name': 'original', 'image': IMG_PATH, 'f': f, 'cx': cx, 'cy': cy,
+              'cam_pos': cam_pos.tolist(), 'R_cw': R_cw.tolist()}]
+for render_path in RENDER_PATHS:
+    pose = VIEW_POSES[render_path]
+    ALL_VIEWS.append({'name': os.path.splitext(os.path.basename(render_path))[0].replace('bench4_02_render_', ''),
+                       'image': render_path, **pose})
+print('views for trajectory prediction:', [v['name'] for v in ALL_VIEWS])
 """)
 
-code(r"""traj_prev = traj0
-for i, render_path in enumerate(RENDER_PATHS):
-    prev_str = ', '.join('(%.0f, %.0f)' % (p[0] / W * 1000.0, p[1] / H * 1000.0) for p in traj_prev)
-    refine_prompt = (
-        'Image 1 is the original view. Image 2 is the SAME scene re-rendered from a different '
-        'viewpoint (built from a monocular depth point cloud -- it may have holes or artifacts). '
-        'Your previous predicted trajectory, in Image 1\'s own pixel coordinates (normalised '
-        '0-1000), for moving the gripper from its start position to grasp the %s was: '
-        '<trajectory> %s </trajectory>. Using Image 2 only to better judge depth and possible '
-        'collisions, REFINE this trajectory -- do not generate an unrelated new one, and keep it '
-        'anchored at the same start position. %s'
-        % (TARGET_LABEL, prev_str, FORMAT_INSTR)
-    )
-    raw_i = RYNN.predict([IMG_PATH, render_path], refine_prompt)
-    print('--- raw RynnBrain output (refine %d, %s) ---' % (i + 1, os.path.basename(render_path)))
-    print(raw_i)
-    traj_i = parse_trajectory(raw_i, W, H)
-    if not traj_i:
-        print('  could not parse -- keeping the previous trajectory for this iteration')
-        traj_i = traj_prev
-    else:
-        _s_err = float(np.hypot(traj_i[0][0] - GRIPPER_TCP_UV[0], traj_i[0][1] - GRIPPER_TCP_UV[1]))
-        if _s_err > 20.0:               # model drifted the start -- re-anchor, don't silently trust it
-            traj_i = [GRIPPER_TCP_UV] + traj_i
-    TRAJ_HISTORY.append({'stage': 'refine_%d_%s' % (i + 1, os.path.basename(render_path)),
-                          'points_px': [list(p) for p in traj_i], 'raw': raw_i})
-    draw_traj(IMG_PATH, traj_i, 'viz/bench4_04_traj_refine_%d.png' % (i + 1), 'refine %d' % (i + 1))
-    traj_prev = traj_i
+code(r"""# --- one FRESH, INDEPENDENT prediction per view -- no view is ever shown a previous answer, so
+# there is nothing for the model to just echo back (the v1 failure mode). Each view's own
+# GRIPPER_TCP_XYZ projection gives the start pixel to tell it.
+PER_VIEW = []
+for vi, v in enumerate(ALL_VIEWS):
+    cam_pos_v = np.array(v['cam_pos'], float); R_cw_v = np.array(v['R_cw'], float)
+    su, sv, sdepth = project_pt(GRIPPER_TCP_XYZ, v['f'], v['cx'], v['cy'], cam_pos_v, R_cw_v)
+    given_start_px = (float(su), float(sv))
+    prompt = build_traj_prompt(su / W * 1000.0, sv / H * 1000.0, TARGET_LABEL)
+    print('--- view %s: given start px (%.1f, %.1f), depth %.3fm ---' % (v['name'], su, sv, sdepth))
+    raw = RYNN.predict([v['image']], prompt)
+    print(raw)
+    traj_px = parse_trajectory(raw, W, H)
+    if not traj_px:
+        print('  could not parse -- skipping this view (fewer views -> triangulation still works with >=2)')
+        PER_VIEW.append({'name': v['name'], 'image': v['image'], 'f': v['f'], 'cx': v['cx'], 'cy': v['cy'],
+                          'cam_pos': cam_pos_v, 'R_cw': R_cw_v, 'given_start_px': given_start_px,
+                          'raw': raw, 'raw_first_px': None, 'traj_px': [], 'endpoint_px': None})
+        continue
+    raw_first_px = traj_px[0]                     # UNMODIFIED model output -- used for the
+                                                    # gripper-anchor self-consistency check below,
+                                                    # never silently replaced.
+    _start_err_px = float(np.hypot(raw_first_px[0] - given_start_px[0], raw_first_px[1] - given_start_px[1]))
+    print('  model start vs given gripper pixel in this view: %.1f px' % _start_err_px)
+    # Numeric safety net for the DRAWN/path-length trajectory only (never for the gripper-anchor
+    # check, which deliberately uses the model's raw, unmodified first point instead). Same 20px
+    # drift threshold as v1's re-anchoring.
+    traj_anchored = [given_start_px] + traj_px if _start_err_px > 20.0 else traj_px
+    PER_VIEW.append({'name': v['name'], 'image': v['image'], 'f': v['f'], 'cx': v['cx'], 'cy': v['cy'],
+                      'cam_pos': cam_pos_v, 'R_cw': R_cw_v, 'given_start_px': given_start_px,
+                      'raw': raw, 'raw_first_px': raw_first_px, 'traj_px': traj_anchored,
+                      'endpoint_px': traj_anchored[-1]})
+    out_png = 'viz/bench4_05_traj_%s.png' % v['name']
+    draw_traj(v['image'], traj_anchored, out_png, v['name'])
+    print('  saved', out_png)
+""")
 
-TRAJ_FINAL = traj_prev
+code(r"""# --- triangulate: (1) the 4 views' ENDPOINTS -> the 3D grasp target (this is the number §5
+# scores against GT_XYZ); (2) the 4 views' RAW (unmodified) START points RynnBrain actually drew
+# -> compared against the KNOWN GRIPPER_TCP_XYZ as a self-consistency check on the whole
+# pipeline's geometry (pose accuracy + whether the model actually complied with the given start).
+def rays_from_views(pixel_key):
+    rays, used = [], []
+    for v in PER_VIEW:
+        px = v.get(pixel_key)
+        if px is None:
+            continue
+        o, d = CM.back_project(px[0], px[1], v['f'], v['cx'], v['cy'], v['cam_pos'], v['R_cw'])
+        rays.append((o, d)); used.append(v['name'])
+    return rays, used
+
+endpoint_rays, endpoint_views_used = rays_from_views('endpoint_px')
+tri_endpoint, tri_endpoint_resid, tri_endpoint_n, tri_endpoint_cond = CM.triangulate_nrays(endpoint_rays)
+print('endpoint triangulation: %s views -> %s' % (endpoint_views_used, tri_endpoint))
+if tri_endpoint is not None:
+    print('  residual %.4fm | n_inliers %d/%d | cond %.3f'
+          % (tri_endpoint_resid, tri_endpoint_n, len(endpoint_rays), tri_endpoint_cond))
+
+start_rays, start_views_used = rays_from_views('raw_first_px')
+tri_gripper, tri_gripper_resid, tri_gripper_n, tri_gripper_cond = CM.triangulate_nrays(start_rays)
+gripper_anchor_residual_mm = None
+if tri_gripper is not None:
+    gripper_anchor_residual_mm = float(np.linalg.norm(tri_gripper - GRIPPER_TCP_XYZ) * 1000.0)
+    print('gripper-anchor triangulation: %s views -> %s | residual %.4fm | n_inliers %d/%d | cond %.3f'
+          % (start_views_used, tri_gripper, tri_gripper_resid, tri_gripper_n, len(start_rays), tri_gripper_cond))
+    print('  vs KNOWN gripper %s -> pipeline self-consistency error: %.1f mm'
+          % (GRIPPER_TCP_XYZ.tolist(), gripper_anchor_residual_mm))
+else:
+    print('gripper-anchor triangulation FAILED (<2 usable views) -- treat the endpoint triangulation with caution')
+
+# --- best-effort/secondary: resample each view's own 2D path by arc-length to K points and
+# triangulate index-by-index -> an approximate 3D path (NOT the primary metric -- endpoint-only
+# triangulation above is what §5 scores).
+def resample_by_arclength(pts, k):
+    pts = np.array(pts, float)
+    if len(pts) < 2:
+        return np.repeat(pts if len(pts) else np.zeros((1, 2)), k, axis=0)
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = cum[-1]
+    if total < 1e-9:
+        return np.repeat(pts[:1], k, axis=0)
+    out = []
+    for t in np.linspace(0.0, total, k):
+        j = int(np.clip(np.searchsorted(cum, t) - 1, 0, len(pts) - 2))
+        seg_t = (t - cum[j]) / max(seg[j], 1e-9)
+        out.append(pts[j] + seg_t * (pts[j + 1] - pts[j]))
+    return np.array(out)
+
+K_PATH = 5
+TRAJ_3D_PATH = []
+_usable_views = [v for v in PER_VIEW if v['traj_px']]
+if len(_usable_views) >= 2:
+    _resampled = {v['name']: resample_by_arclength(v['traj_px'], K_PATH) for v in _usable_views}
+    for k in range(K_PATH):
+        rays_k = []
+        for v in _usable_views:
+            uk, vk = _resampled[v['name']][k]
+            o, d = CM.back_project(float(uk), float(vk), v['f'], v['cx'], v['cy'], v['cam_pos'], v['R_cw'])
+            rays_k.append((o, d))
+        p, resid, n, cond = CM.triangulate_nrays(rays_k)
+        TRAJ_3D_PATH.append({'k': k, 'xyz': None if p is None else p.tolist(),
+                              'resid_m': resid, 'n': n, 'cond': cond})
+    print('resampled 3D path (%d pts, secondary/best-effort):' % K_PATH,
+          [r['xyz'] for r in TRAJ_3D_PATH])
+else:
+    print('fewer than 2 usable views -- skipping the secondary resampled 3D path')
+
 with open('trajectory.json', 'w') as fjs:
-    _json.dump({'history': TRAJ_HISTORY, 'final_px': [list(p) for p in TRAJ_FINAL],
-                'gripper_start_px': list(GRIPPER_TCP_UV), 'image_wh': [int(W), int(H)]}, fjs, indent=2)
-print('saved trajectory.json with', len(TRAJ_HISTORY), 'stages; final has', len(TRAJ_FINAL), 'points')
+    _json.dump({
+        'per_view': [{'name': v['name'], 'image': v['image'],
+                      'given_start_px': list(v['given_start_px']),
+                      'raw_first_px': None if v['raw_first_px'] is None else list(v['raw_first_px']),
+                      'traj_px': [list(p) for p in v['traj_px']],
+                      'endpoint_px': None if v['endpoint_px'] is None else list(v['endpoint_px']),
+                      'raw': v['raw']} for v in PER_VIEW],
+        'gripper_xyz_known': GRIPPER_TCP_XYZ.tolist(),
+        'triangulated_endpoint_xyz': None if tri_endpoint is None else tri_endpoint.tolist(),
+        'triangulated_endpoint_resid_m': tri_endpoint_resid,
+        'triangulated_endpoint_n_inliers': tri_endpoint_n,
+        'triangulated_endpoint_cond': tri_endpoint_cond,
+        'triangulated_endpoint_views_used': endpoint_views_used,
+        'gripper_anchor_triangulated_xyz': None if tri_gripper is None else tri_gripper.tolist(),
+        'gripper_anchor_resid_m': tri_gripper_resid,
+        'gripper_anchor_n_inliers': tri_gripper_n,
+        'gripper_anchor_cond': tri_gripper_cond,
+        'gripper_anchor_residual_mm': gripper_anchor_residual_mm,
+        'gripper_anchor_views_used': start_views_used,
+        'trajectory_3d_resampled': TRAJ_3D_PATH,
+    }, fjs, indent=2)
+print('saved trajectory.json (%d views)' % len(PER_VIEW))
 RYNN.free()
-print('RynnBrain freed. Stage B trajectory prediction complete -- proceed to 5. Evaluate.')
+print('RynnBrain freed. Stage B trajectory prediction + triangulation complete -- proceed to 5. Evaluate.')
 """)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Evaluate
 # ─────────────────────────────────────────────────────────────────────────────
-md(r"""## 5. Evaluate — 2D pixel error, 3D world error (DA3-depth confound), improvement, consistency
+md(r"""## 5. Evaluate — 2D pixel error (original view), 3D error from TRIANGULATION, gripper-anchor check
 
-Reports the 2D pixel endpoint error (depth-model-independent — pure "did it point at the cube")
-and the 3D world error (lifts the predicted pixel through DA3's OWN saved depth, never
-`GT_DEPTH_M`) **separately**, so trajectory accuracy and depth-model quality don't get conflated
-into one number. `GT_UV`/`GT_XYZ`/`GT_DEPTH_M` are used for the first time in this notebook, here.""")
+**v2 change:** the 3D error no longer comes from reading DA3's depth at the predicted pixel (v1's
+only 3D number, and the source of the 1639mm miss) — it comes from `triangulate_nrays` over the
+4 views' endpoints (§4B). The depth model's role has shrunk to producing an honest point cloud for
+framing the renders, not carrying the 3D estimate by itself. `GT_UV`/`GT_XYZ`/`GT_DEPTH_M` are
+used for the first time in this notebook, here.""")
 
-code(r"""depth_m_saved = np.load('viz/bench4_depth_m.npy')     # from Stage A, persisted across the restart
+code(r"""# 2D: the ORIGINAL view's own endpoint vs the true pixel (depth-model- and triangulation-independent).
+_orig = next(v for v in PER_VIEW if v['name'] == 'original')
+endpoint_err_2d_px = None
+if _orig['endpoint_px'] is not None:
+    endpoint_err_2d_px = float(np.hypot(_orig['endpoint_px'][0] - GT_UV[0], _orig['endpoint_px'][1] - GT_UV[1]))
 
-pred_uv = TRAJ_FINAL[-1]                                  # final trajectory endpoint = predicted grasp pixel
-err_2d_px_final = float(np.hypot(pred_uv[0] - GT_UV[0], pred_uv[1] - GT_UV[1]))
-init_uv = traj0[-1]
-err_2d_px_initial = float(np.hypot(init_uv[0] - GT_UV[0], init_uv[1] - GT_UV[1]))
+# 3D: triangulated endpoint (from §4B) vs GT_XYZ -- REPLACES the old depth-lookup 3D estimate.
+endpoint_err_3d_mm = None
+if tri_endpoint is not None:
+    endpoint_err_3d_mm = float(np.linalg.norm(tri_endpoint - GT_XYZ) * 1000.0)
 
-pu = int(round(np.clip(pred_uv[0], 0, W - 1))); pv = int(round(np.clip(pred_uv[1], 0, H - 1)))
-pred_depth_m = float(depth_m_saved[pv, pu])
-pred_xyz = CM.point_at_depth(pred_uv[0], pred_uv[1], f, cx, cy, cam_pos, R_cw, pred_depth_m)
-err_3d_mm_final = float(np.linalg.norm(pred_xyz - GT_XYZ) * 1000.0)
-
-def path_len(traj):
-    return float(sum(np.hypot(traj[i + 1][0] - traj[i][0], traj[i + 1][1] - traj[i][1])
-                      for i in range(len(traj) - 1)))
-
-path_lengths = [round(path_len(h['points_px']), 1) for h in TRAJ_HISTORY]
-endpoints = np.array([h['points_px'][-1] for h in TRAJ_HISTORY])
-consistency_px = float(np.mean(np.linalg.norm(endpoints[1:] - endpoints[:-1], axis=1))) if len(endpoints) > 1 else 0.0
+# Load Stage A's calibration diagnostics (best-effort -- purely informational in this metrics
+# dict, not used to compute any of the above).
+_depth_calib = {}
+try:
+    with open('viz/bench4_depth_calib.json') as _fjs:
+        _depth_calib = json.load(_fjs)
+except Exception as _e:
+    print('no viz/bench4_depth_calib.json found (%s) -- Stage A calibration diagnostics omitted' % _e)
 
 metrics = {
     'frame': IMG_PATH,
-    'endpoint_err_2d_px_initial': round(err_2d_px_initial, 1),
-    'endpoint_err_2d_px_final': round(err_2d_px_final, 1),
-    'improvement_2d_px': round(err_2d_px_initial - err_2d_px_final, 1),
-    'endpoint_err_3d_mm_final': round(err_3d_mm_final, 1),
-    'pred_depth_m_at_endpoint': round(pred_depth_m, 4),
-    'gt_depth_m_at_endpoint': round(GT_DEPTH_M, 4),
-    'path_length_px_per_stage': path_lengths,
-    'endpoint_consistency_px_mean_step': round(consistency_px, 1),
-    'n_refinement_stages': len(TRAJ_HISTORY) - 1,
+    'endpoint_err_2d_px': None if endpoint_err_2d_px is None else round(endpoint_err_2d_px, 1),
+    'endpoint_err_3d_mm': None if endpoint_err_3d_mm is None else round(endpoint_err_3d_mm, 1),
+    'gripper_anchor_residual_mm': None if gripper_anchor_residual_mm is None else round(gripper_anchor_residual_mm, 1),
+    'tri_residual_mm': None if tri_endpoint_resid is None else round(tri_endpoint_resid * 1000.0, 2),
+    'tri_cond': tri_endpoint_cond,
+    'tri_n_inliers': tri_endpoint_n,
+    'tri_views_used': endpoint_views_used,
+    'gripper_tri_residual_mm': None if tri_gripper_resid is None else round(tri_gripper_resid * 1000.0, 2),
+    'gripper_tri_cond': tri_gripper_cond,
+    'gripper_tri_views_used': start_views_used,
+    'per_view_endpoint_px': {v['name']: (None if v['endpoint_px'] is None
+                                          else [round(v['endpoint_px'][0], 1), round(v['endpoint_px'][1], 1)])
+                             for v in PER_VIEW},
+    'depth_calibration': _depth_calib,
     'rynnbrain_model': RYNNBRAIN_MODEL_ID,
     'depth_model': DEPTH_MODEL_ID,
 }
@@ -679,32 +959,63 @@ md("## 6. Report — Markdown, with every image + the honest caveat")
 code(r"""_report_lines = []
 def R(s=''): _report_lines.append(s)
 
-R('# Benchmark 4 report — DA3 point-cloud + RynnBrain iterative trajectory')
+R('# Benchmark 4 report (v2) — calibrated DA3 point-cloud + RynnBrain multi-view triangulation')
 R('')
 R('Frame: `%s` | gripper start px (%.1f, %.1f) | target prompt: "%s"'
   % (IMG_PATH, GRIPPER_TCP_UV[0], GRIPPER_TCP_UV[1], TARGET_LABEL))
 R('')
+R('## Depth calibration (§4A)')
+R('')
+if metrics.get('depth_calibration'):
+    _dc = metrics['depth_calibration']
+    R('Robust inverse-depth affine fit: a=%.6g b=%.6g (%d/%d anchors used after outlier rejection).'
+      % (_dc.get('a', float('nan')), _dc.get('b', float('nan')),
+         _dc.get('n_anchors_used', 0), _dc.get('n_anchors_total', 0)))
+    R('Gripper-pixel check: raw %.3fm -> calibrated %.3fm (true %.3fm).'
+      % (_dc.get('gripper_check_raw_m', float('nan')), _dc.get('gripper_check_calibrated_m', float('nan')),
+         _dc.get('gripper_check_true_m', float('nan'))))
+else:
+    R('(no viz/bench4_depth_calib.json found -- Stage A calibration diagnostics unavailable)')
+R('')
 R('## Images')
 R('')
-R('Original RGB (the only image RynnBrain sees first):')
+R('Original RGB (the true side-cam view):')
 R('')
 R('![original](bench4_00_original_rgb.png)')
 R('')
-R('DA3 predicted metric depth:')
+R('DA3 depth, calibrated:')
 R('')
 R('![depth](bench4_01_depth_da3.png)')
 R('')
-R('Rendered point-cloud viewpoints (re-renders of the SAME monocular cloud, not new geometry -- see the caveat below):')
+R('Rendered point-cloud viewpoints (re-renders of the SAME calibrated monocular cloud, not new geometry -- see the caveat below):')
 R('')
 for p in RENDER_PATHS:
     R('![%s](%s)' % (os.path.basename(p), os.path.basename(p)))
 R('')
-R('## Trajectory refinement')
+R('## Per-view trajectories (each an INDEPENDENT prediction — no view was shown a previous answer)')
 R('')
-R('![initial trajectory](bench4_03_traj_initial.png)')
+for v in PER_VIEW:
+    _png = 'bench4_05_traj_%s.png' % v['name']
+    if os.path.exists('viz/' + _png):
+        R('**%s** (given start px %s, endpoint px %s):' % (v['name'], v['given_start_px'], v['endpoint_px']))
+        R('')
+        R('![%s](%s)' % (v['name'], _png))
+        R('')
+    else:
+        R('**%s**: no trajectory drawn (parse failed) — raw: `%s`' % (v['name'], v['raw'][:200].replace(chr(10), ' ')))
+        R('')
+R('## Triangulation')
 R('')
-for i in range(len(RENDER_PATHS)):
-    R('![refine %d](bench4_04_traj_refine_%d.png)' % (i + 1, i + 1))
+R('- Endpoint (grasp target) triangulated from views %s: `%s`, residual %s m, cond %s, n_inliers %s/%d'
+  % (metrics['tri_views_used'],
+     None if tri_endpoint is None else [round(c, 4) for c in tri_endpoint.tolist()],
+     None if tri_endpoint_resid is None else round(tri_endpoint_resid, 5), metrics['tri_cond'],
+     metrics['tri_n_inliers'], len(PER_VIEW)))
+R('- Gripper-anchor self-consistency: triangulated the RAW start points RynnBrain actually drew '
+  '(views %s) -> `%s`, vs the KNOWN gripper `%s` -> **residual %s mm**'
+  % (metrics['gripper_tri_views_used'],
+     None if tri_gripper is None else [round(c, 4) for c in tri_gripper.tolist()],
+     GRIPPER_TCP_XYZ.tolist(), metrics['gripper_anchor_residual_mm']))
 R('')
 R('## Metrics')
 R('')
@@ -712,34 +1023,34 @@ R('```json')
 R(json.dumps(metrics, indent=2))
 R('```')
 R('')
-R('## Raw trajectory per stage')
-R('')
-for h in TRAJ_HISTORY:
-    _raw_1line = h['raw'].replace(chr(10), ' ')[:200]
-    R('- **%s**: %d points, raw model text: `%s`' % (h['stage'], len(h['points_px']), _raw_1line))
-R('')
 R('## Conclusion')
 R('')
-did_improve = metrics['improvement_2d_px'] > 0
-R('Iterative multi-view point-cloud refinement %s the endpoint on this single frame (initial '
-  '%.1f px -> final %.1f px from the true pixel; %+.1f px). **n=1 -- directional signal only, '
-  'not a statistically powered claim; do not generalise from one frame.**'
-  % ('IMPROVED' if did_improve else 'did NOT improve',
-     metrics['endpoint_err_2d_px_initial'], metrics['endpoint_err_2d_px_final'], metrics['improvement_2d_px']))
+if metrics['endpoint_err_3d_mm'] is not None:
+    R('Triangulated 3D endpoint error on this single frame: **%.1f mm** (vs v1\'s depth-lookup '
+      '1639.3mm). 2D endpoint error in the original view: **%s px**. Gripper-anchor '
+      'self-consistency residual: **%s mm** — a LOW value here means the pose geometry and '
+      'RynnBrain\'s per-view compliance are both trustworthy, so a large endpoint error would '
+      'point at the target localisation itself rather than the pipeline plumbing; a HIGH value '
+      'means the endpoint number is confounded by pipeline geometry error and should not be read '
+      'at face value. **n=1 -- directional signal only, not a statistically powered claim; do '
+      'not generalise from one frame.**'
+      % (metrics['endpoint_err_3d_mm'], metrics['endpoint_err_2d_px'], metrics['gripper_anchor_residual_mm']))
+else:
+    R('Triangulation FAILED (fewer than 2 views produced a parseable endpoint) -- see the raw '
+      'per-view outputs above for why.')
 R('')
-R('**Honest caveat (novel views of a monocular cloud):** the 3 "novel" viewpoints above are '
-  're-renders of ONE monocular point cloud -- they do not reveal any surface the original camera '
-  'could not already see (front-facing points only, with holes at silhouettes and behind '
-  'occluders). So this experiment tests whether re-rendered depth CUES from a different angle '
-  'help RynnBrain reason about a fixed, already-known set of 3D points -- not whether genuinely '
-  'new geometry (a second real camera, a wrist-mounted sensor) would help. A positive result '
-  'here says "showing the same facts differently helps a VLA reason"; it is not evidence that '
-  'multi-view re-rendering could substitute for real multi-camera triangulation.')
-R('')
-R('**3D error confound:** the 3D world error lifts the predicted pixel through DA3\'s OWN metric '
-  'depth (never ground truth) -- it is therefore a joint score of (trajectory endpoint accuracy) '
-  '× (DA3 depth accuracy at that pixel), not trajectory accuracy alone. The 2D pixel error '
-  'above isolates the trajectory-only signal; read the two together, not the 3D number in isolation.')
+R('**Honest caveat (novel views of a monocular, now-calibrated cloud):** the 3 rendered '
+  'viewpoints above are re-renders of ONE monocular point cloud -- they do not reveal any surface '
+  'the original camera could not already see (front-facing points only, with holes at '
+  'silhouettes and behind occluders). Calibrating the depth (§4A) fixes the cloud\'s ABSOLUTE '
+  'SCALE, not this fundamental single-view coverage limit. So triangulating RynnBrain\'s per-view '
+  'picks converts its 2D reasoning into a 3D estimate and AVERAGES OUT its per-view localisation '
+  'noise/pose error — it cannot invent depth or geometry the calibrated cloud does not contain. '
+  'This is exactly why the depth calibration in §4A is a prerequisite for this experiment to mean '
+  'anything: triangulating over badly-scaled renders would still triangulate confidently to the '
+  'wrong place. Read the gripper-anchor residual above as the honest bound on what this pipeline '
+  '(pose geometry + calibration + RynnBrain compliance) can currently promise, independent of '
+  'whether RynnBrain correctly identifies the target itself.')
 
 _report_md = '\n'.join(_report_lines)
 with open('viz/bench4_report.md', 'w') as fmd:
